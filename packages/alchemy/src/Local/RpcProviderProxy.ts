@@ -36,7 +36,11 @@ const make = Effect.fnUntraced(function* (spawnerUrl: string) {
       const payload: RpcSpawnPayload = {
         serverEntryUrl,
         alchemyContext,
-        stack: { name: stack.name, stage: stack.stage },
+        stack: {
+          name: stack.name,
+          stage: stack.stage,
+          localDomain: stack.localDomain,
+        },
       };
       const response = yield* client.post(spawnerUrl, {
         body: yield* HttpBody.json(payload),

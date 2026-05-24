@@ -1,8 +1,8 @@
 import {
-  layerLocalProxy,
-  layerRuntime,
   Runtime,
   RuntimeError,
+  layerLocalProxy,
+  layerRuntime,
   type BindingHook,
   type BindingServices,
   type HyperdriveOrigin,
@@ -48,8 +48,9 @@ import type * as Bundle from "../../Bundle/Bundle.ts";
 import { InstanceId } from "../../InstanceId.ts";
 import * as RpcProvider from "../../Local/RpcProvider.ts";
 import type { ResourceBinding } from "../../Resource.ts";
-import { Stack } from "../../Stack.ts";
+import { Stack, type StackSpec } from "../../Stack.ts";
 import { Stage } from "../../Stage.ts";
+import { syncLocalHosts } from "../../Util/LocalHosts.ts";
 import { CloudflareEnvironment } from "../CloudflareEnvironment.ts";
 import type { WorkerAssetsConfig, WorkerProps } from "../Workers/Worker.ts";
 import { getCompatibility } from "./Compatibility.ts";
@@ -309,6 +310,18 @@ export const LocalWorkerProvider = () =>
 
       const rootScope = yield* Effect.scope;
       const workerdScopes = new Map<string, Scope.Closeable>();
+      const localHostnames = new Map<string, string>();
+      const localHostsMarker = `cloudflare:${stack.stage}:${stack.name}`;
+      const syncStackHosts = () =>
+        stack.localDomain === undefined
+          ? Effect.void
+          : syncLocalHosts(localHostsMarker, localHostnames.values());
+      if (stack.localDomain !== undefined) {
+        yield* Scope.addFinalizer(
+          rootScope,
+          syncLocalHosts(localHostsMarker, []),
+        );
+      }
 
       const context = yield* Effect.context<RuntimeServices>();
       const instances = new Map<
@@ -331,7 +344,13 @@ export const LocalWorkerProvider = () =>
       }) {
         const { id, props, bindings } = options;
         const config = yield* buildConfig(options);
-        const url = yield* localProxy.registerWorker(id);
+        const proxyUrl = yield* localProxy.registerWorker(id);
+        const url = toLocalWorkerUrl(id, proxyUrl, stack.localDomain);
+        const localHostname = new URL(url).hostname;
+        if (stack.localDomain !== undefined) {
+          localHostnames.set(id, localHostname);
+          yield* syncStackHosts();
+        }
         if (props.vite) {
           const devServer = yield* Vite.viteDev(
             props.vite.rootDir,
@@ -350,6 +369,9 @@ export const LocalWorkerProvider = () =>
               },
               context,
             },
+            stack.localDomain === undefined
+              ? undefined
+              : { allowedHosts: [localHostname] },
           );
           const localAddress = devServer.resolvedUrls!.local[0].slice(0, -1);
           yield* localProxy.setLocalAddress(id, localAddress);
@@ -425,6 +447,9 @@ export const LocalWorkerProvider = () =>
             yield* Fiber.interrupt(existing.fiber);
             yield* Scope.close(existing.scope, Exit.void);
             instances.delete(id);
+          }
+          if (localHostnames.delete(id)) {
+            yield* syncStackHosts();
           }
         }),
       };
@@ -528,6 +553,26 @@ const toRuntimeAssets = (
     serveDirectly: assets.config?.serveDirectly,
   };
 };
+
+const toLocalWorkerUrl = (
+  id: string,
+  proxyUrl: string,
+  localDomain: StackSpec["localDomain"],
+): string => {
+  if (localDomain === undefined) {
+    return proxyUrl;
+  }
+  const url = new URL(proxyUrl);
+  url.hostname = `${toDnsLabel(id)}.${localDomain.domain}.${localDomain.tld}`;
+  return url.toString().replace(/\/$/, "");
+};
+
+const toDnsLabel = (value: string): string =>
+  value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 
 const toRuntimeDurableObjectNamespaces = (
   namespaces: Record<string, string>,

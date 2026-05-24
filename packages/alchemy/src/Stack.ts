@@ -64,6 +64,28 @@ export type Stack = Context.ServiceClass.Shape<
 export interface StackProps<Req> {
   providers: Layer.Layer<NoInfer<Req>, never, StackServices>;
   state: Layer.Layer<State, never, StackServices>;
+  /**
+   * Opt-in local development top-level domain.
+   *
+   * When set, local Cloudflare workers are exposed as
+   * `<worker>.<stack-name>.<customTld>` instead of `<worker>.localhost`.
+   * Alchemy will best-effort sync concrete hostnames to `/etc/hosts`.
+   *
+   * @example
+   * ```ts
+   * Alchemy.Stack("myapp", {
+   *   providers: Cloudflare.providers(),
+   *   state: Cloudflare.state(),
+   *   customTld: "test",
+   * }, ...)
+   * ```
+   */
+  customTld?: string;
+  /**
+   * Optional local development domain label. Defaults to a DNS-safe slug of
+   * the stack name.
+   */
+  customDomain?: string;
 }
 
 export const Stack: Context.ServiceClass<
@@ -158,6 +180,10 @@ const createStageProxy = (stackName: string) =>
 export interface StackSpec<Output = any> {
   name: string;
   stage: string;
+  localDomain?: {
+    domain: string;
+    tld: string;
+  };
   // @internal
   resources: {
     [logicalId: string]: ResourceLike;
@@ -185,6 +211,8 @@ export interface MakeStackProps<ROut = never> {
   name: string;
   providers: Layer.Layer<ROut, never, StackServices>;
   state: Layer.Layer<State, never, StackServices>;
+  customTld?: string;
+  customDomain?: string;
   /** @internal */
   stack?: StackSpec;
 }
@@ -232,6 +260,15 @@ export const make =
                     options.stack ?? {
                       name: options.name,
                       stage,
+                      localDomain:
+                        options.customTld === undefined
+                          ? undefined
+                          : {
+                              domain:
+                                options.customDomain ??
+                                toDnsLabel(options.name),
+                              tld: toDnsLabel(options.customTld),
+                            },
                       resources: {},
                       bindings: {},
                       actions: {},
@@ -334,3 +371,10 @@ export const evalStack = <A, B, Err, Req>(
     ? Effect.scoped(body)
     : Scope.provide(body, options.scope);
 };
+
+const toDnsLabel = (value: string): string =>
+  value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "");

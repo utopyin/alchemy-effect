@@ -18,6 +18,10 @@ export interface RpcServerEnvironment {
   stack: {
     name: string;
     stage: string;
+    localDomain?: {
+      domain: string;
+      tld: string;
+    };
   };
 }
 
@@ -37,6 +41,7 @@ export const layer = (environment: RpcServerEnvironment) =>
     Layer.succeed(Stack, {
       name: environment.stack.name,
       stage: environment.stack.stage,
+      localDomain: environment.stack.localDomain,
       resources: {},
       bindings: {},
       actions: {},
