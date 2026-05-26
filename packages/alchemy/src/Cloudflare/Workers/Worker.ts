@@ -28,6 +28,7 @@ import { CloudflareEnvironment } from "../CloudflareEnvironment.ts";
 import type { HyperdriveDevOrigin } from "../Hyperdrive/Hyperdrive.ts";
 import { CloudflareLogs } from "../Logs.ts";
 import type { Providers } from "../Providers.ts";
+import { resolveZoneId, type ZoneReference } from "../Zone/index.ts";
 import {
   readAssets,
   uploadAssets,
@@ -175,6 +176,28 @@ export type NormalizedBindings<
 
 export type WorkerAssetsConfig = string | AssetsProps | AssetsWithHash;
 
+export interface WorkerRouteProps {
+  /**
+   * URL pattern to match incoming requests against, e.g.
+   * `"subdomain.example.com/*"` or `"example.com/api/*"`.
+   */
+  pattern: string;
+  /**
+   * Cloudflare zone ID. Equivalent to Wrangler's `zone_id`.
+   */
+  zoneId?: string;
+  /**
+   * Cloudflare zone name, e.g. `"example.com"`. Equivalent to Wrangler's
+   * `zone_name`.
+   */
+  zoneName?: string;
+  /**
+   * Zone reference — a zone ID, zone name, or `{ zoneId, name? }` object.
+   * Alternative to `zoneId` / `zoneName`.
+   */
+  zone?: ZoneReference;
+}
+
 export interface WorkerProps<
   Bindings extends WorkerBindingProps = any,
   Assets extends WorkerAssetsConfig | undefined =
@@ -272,6 +295,13 @@ export interface WorkerProps<
    */
   domain?: string | string[];
   /**
+   * Zone routes that map URL patterns to this Worker. Equivalent to Wrangler's
+   * `routes` array — provide `zoneName` or `zoneId` (or `zone`) alongside each
+   * `pattern`. When the zone is omitted, it is inferred from the pattern's
+   * hostname.
+   */
+  routes?: WorkerRouteProps[];
+  /**
    * Extra bundler options applied on top of the standard rolldown input/output
    * options used to build this Worker. See {@link Bundle.BundleExtraOptions}.
    */
@@ -320,6 +350,7 @@ export type Worker<Bindings extends WorkerBindings = any> = Resource<
     durableObjectNamespaces: Record<string, string>;
     accountId: string;
     domains: string[];
+    routes: { id: string; pattern: string; zoneId: string }[];
     crons: string[];
     hash?: {
       assets: string | undefined;
@@ -518,6 +549,17 @@ export type Worker<Bindings extends WorkerBindings = any> = Resource<
  * {
  *   main: import.meta.filename,
  *   assets: "./public",
+ * }
+ * ```
+ *
+ * @example Zone routes
+ * ```typescript
+ * {
+ *   main: import.meta.filename,
+ *   routes: [
+ *     { pattern: "api.example.com/*", zoneName: "example.com" },
+ *     { pattern: "example.com/api/*", zoneId: "<YOUR_ZONE_ID>" },
+ *   ],
  * }
  * ```
  *
@@ -787,6 +829,9 @@ export const LiveWorkerProvider = () =>
       const putDomain = yield* workers.putDomain;
       const listDomains = yield* workers.listDomains;
       const deleteDomain = yield* workers.deleteDomain;
+      const createRoute = yield* workers.createRoute;
+      const deleteRoute = yield* workers.deleteRoute;
+      const listRoutes = yield* workers.listRoutes;
       const listZones = yield* zones.listZones;
       const telemetry = yield* CloudflareLogs;
 
@@ -830,6 +875,212 @@ export const LiveWorkerProvider = () =>
                 (Array.isArray(domain) ? domain : [domain]).map(toPunycode),
               ),
             );
+
+      type NormalizedWorkerRoute = {
+        pattern: string;
+        zoneId: string;
+      };
+
+      const routeKey = (route: { pattern: string; zoneId: string }) =>
+        `${route.zoneId}:${route.pattern}`;
+
+      const hostnameFromPattern = (pattern: string): string => {
+        const hostPart = pattern.split("/")[0] ?? pattern;
+        return hostPart.startsWith("*.")
+          ? `routes.${hostPart.slice(2)}`
+          : hostPart;
+      };
+
+      /**
+       * Infer the Cloudflare Zone ID for a given hostname by listing the
+       * account's zones and matching the hostname against each zone's name —
+       * walking up the DNS label hierarchy until a match is found.
+       */
+      const inferZoneIdForHostname = (
+        hostname: string,
+        zoneCache: Map<string, string>,
+      ) =>
+        Effect.gen(function* () {
+          const cached = zoneCache.get(hostname);
+          if (cached) return cached;
+
+          const zoneList = yield* listZones({}).pipe(
+            Effect.map((response) => response.result ?? []),
+          );
+          for (const zone of zoneList) {
+            zoneCache.set(zone.name, zone.id);
+          }
+
+          const parts = hostname.split(".");
+          for (let i = 0; i < parts.length - 1; i++) {
+            const candidate = parts.slice(i).join(".");
+            const match = zoneList.find((z) => z.name === candidate);
+            if (match) {
+              zoneCache.set(hostname, match.id);
+              return match.id;
+            }
+          }
+          return yield* Effect.die(
+            `Could not infer Cloudflare Zone for hostname "${hostname}". ` +
+              "Ensure the parent zone exists in this account.",
+          );
+        });
+
+      const normalizeRoutes = (routes: WorkerRouteProps[] | undefined) =>
+        Effect.gen(function* () {
+          if (!routes?.length) return [] as NormalizedWorkerRoute[];
+          const zoneCache = new Map<string, string>();
+          const normalized: NormalizedWorkerRoute[] = [];
+          const seen = new Set<string>();
+          for (const route of routes) {
+            const pattern = route.pattern.trim();
+            const zoneId = route.zoneId
+              ? route.zoneId
+              : route.zone || route.zoneName
+                ? yield* resolveZoneId({
+                    accountId,
+                    zone: route.zone ?? route.zoneName!,
+                    hostname: hostnameFromPattern(pattern),
+                  })
+                : yield* inferZoneIdForHostname(
+                    hostnameFromPattern(pattern),
+                    zoneCache,
+                  );
+            const key = routeKey({ pattern, zoneId });
+            if (seen.has(key)) continue;
+            seen.add(key);
+            normalized.push({ pattern, zoneId });
+          }
+          return normalized;
+        });
+
+      const listWorkerRoutesInZones = (
+        scriptName: string,
+        zoneIds: readonly string[],
+      ) => {
+        const uniqueZoneIds = Array.from(new Set(zoneIds));
+        if (uniqueZoneIds.length === 0) {
+          return Effect.succeed([] as Worker["Attributes"]["routes"]);
+        }
+
+        const routesByZone = Effect.all(
+          uniqueZoneIds.map((zoneId) =>
+            listRoutes({ zoneId }).pipe(
+              Effect.map((response) => {
+                const routes = response.result ?? [];
+                return routes.flatMap((route) => {
+                  const shouldDelete =
+                    !route.id || !route.pattern || route.script !== scriptName;
+                  return shouldDelete
+                    ? []
+                    : [{ id: route.id, pattern: route.pattern, zoneId }];
+                });
+              }),
+              Effect.catch(() => Effect.succeed([])),
+            ),
+          ),
+          { concurrency: "unbounded" },
+        );
+
+        return Effect.map(routesByZone, (routes) => routes.flat());
+      };
+
+      const readWorkerRoutes = (scriptName: string) =>
+        Effect.gen(function* () {
+          const zoneList = yield* listZones({}).pipe(
+            Effect.map((response) => response.result ?? []),
+          );
+          const accountZones = zoneList.filter(
+            (zone) => zone.account?.id === accountId,
+          );
+          return yield* listWorkerRoutesInZones(
+            scriptName,
+            accountZones.map((zone) => zone.id),
+          );
+        });
+
+      const reconcileRoutes = (
+        scriptName: string,
+        desired: NormalizedWorkerRoute[],
+        previous: Worker["Attributes"]["routes"],
+      ) =>
+        Effect.gen(function* () {
+          const zoneIds = Array.from(
+            new Set([
+              ...desired.map((route) => route.zoneId),
+              ...previous.map((route) => route.zoneId),
+            ]),
+          );
+          const liveAll = yield* listWorkerRoutesInZones(scriptName, zoneIds);
+          const desiredKeys = new Set(desired.map(routeKey));
+          const liveByKey = new Map(
+            liveAll.map((route) => [routeKey(route), route]),
+          );
+
+          const toRemove = liveAll.filter(
+            (route) => !desiredKeys.has(routeKey(route)),
+          );
+          yield* Effect.all(
+            toRemove.map((route) =>
+              deleteRoute({ zoneId: route.zoneId, routeId: route.id }).pipe(
+                Effect.catchTag("RouteNotFound", () => Effect.void),
+              ),
+            ),
+            { concurrency: "unbounded" },
+          );
+
+          if (desired.length === 0) return [];
+
+          const attachRoute = Effect.fnUntraced(function* (
+            route: NormalizedWorkerRoute,
+          ) {
+            const existing = liveByKey.get(routeKey(route));
+            if (existing) return existing;
+
+            const zoneRoutes = yield* listRoutes({ zoneId: route.zoneId }).pipe(
+              Effect.map((response) => response.result ?? []),
+              Effect.catch(() => Effect.succeed([])),
+            );
+            const otherOwner = zoneRoutes.find(
+              (candidate) =>
+                candidate.pattern === route.pattern &&
+                candidate.script &&
+                candidate.script !== scriptName,
+            );
+            if (otherOwner) {
+              return yield* Effect.die(
+                new Error(
+                  `Cannot attach route '${route.pattern}' to Worker '${scriptName}': ` +
+                    `it is already attached to Worker '${otherOwner.script}'. ` +
+                    `Remove it from that Worker first, or pick a different pattern.`,
+                ),
+              );
+            }
+
+            const created = yield* createRoute({
+              zoneId: route.zoneId,
+              pattern: route.pattern,
+              script: scriptName,
+            }).pipe(
+              Effect.retry({
+                while: (error: { _tag?: string }) =>
+                  error?._tag === "WorkerNotFound",
+                schedule: Schedule.exponential(200).pipe(
+                  Schedule.both(Schedule.recurs(15)),
+                ),
+              }),
+            );
+            return {
+              id: created.id,
+              pattern: created.pattern,
+              zoneId: route.zoneId,
+            };
+          });
+
+          return yield* Effect.all(desired.map(attachRoute), {
+            concurrency: "unbounded",
+          });
+        });
 
       const normalizeCrons = (crons: string[] | undefined): string[] =>
         Array.from(new Set(crons ?? []));
@@ -882,41 +1133,6 @@ export const LiveWorkerProvider = () =>
           );
           return normalizeCrons(
             result.schedules.map((schedule) => schedule.cron),
-          );
-        });
-
-      /**
-       * Infer the Cloudflare Zone ID for a given hostname by listing the
-       * account's zones and matching the hostname against each zone's name —
-       * walking up the DNS label hierarchy until a match is found.
-       */
-      const inferZoneIdForHostname = (
-        hostname: string,
-        zoneCache: Map<string, string>,
-      ) =>
-        Effect.gen(function* () {
-          const cached = zoneCache.get(hostname);
-          if (cached) return cached;
-
-          const zoneList = yield* listZones({}).pipe(
-            Effect.map((response) => response.result ?? []),
-          );
-          for (const zone of zoneList) {
-            zoneCache.set(zone.name, zone.id);
-          }
-
-          const parts = hostname.split(".");
-          for (let i = 0; i < parts.length - 1; i++) {
-            const candidate = parts.slice(i).join(".");
-            const match = zoneList.find((z) => z.name === candidate);
-            if (match) {
-              zoneCache.set(hostname, match.id);
-              return match.id;
-            }
-          }
-          return yield* Effect.die(
-            `Could not infer Cloudflare Zone for hostname "${hostname}". ` +
-              "Ensure the parent zone exists in this account.",
           );
         });
 
@@ -1716,6 +1932,18 @@ export const LiveWorkerProvider = () =>
           ...reconciled.map((d) => `https://${d.hostname}`),
           ...(workersDevUrl ? [workersDevUrl] : []),
         ];
+        const desiredRoutes = yield* normalizeRoutes(news.routes);
+        const previousRoutes = output?.routes ?? [];
+        if (desiredRoutes.length > 0 || previousRoutes.length > 0) {
+          yield* session.note(
+            `Reconciling worker routes (${desiredRoutes.length}) ...`,
+          );
+        }
+        const routes = yield* reconcileRoutes(
+          name,
+          desiredRoutes,
+          previousRoutes,
+        );
         const crons = yield* reconcileCrons(
           name,
           normalizeCrons([...getCronBindings(bindings), ...(news.crons ?? [])]),
@@ -1731,6 +1959,7 @@ export const LiveWorkerProvider = () =>
           durableObjectNamespaces,
           accountId,
           domains,
+          routes,
           crons,
           hash,
         } satisfies Worker["Attributes"];
@@ -1830,6 +2059,12 @@ export const LiveWorkerProvider = () =>
           const domainsChanged =
             newDomains.length !== oldDomains.length ||
             newDomains.some((d, i) => d !== oldDomains[i]);
+          const newRoutes = yield* normalizeRoutes(news.routes);
+          const oldRoutes = (output?.routes ?? []).map(routeKey).sort();
+          const newRouteKeys = newRoutes.map(routeKey).sort();
+          const routesChanged =
+            newRouteKeys.length !== oldRoutes.length ||
+            newRouteKeys.some((key, index) => key !== oldRoutes[index]);
           const newCrons = normalizeCrons([
             ...(Array.isArray(newBindings)
               ? getCronBindings(
@@ -1844,6 +2079,7 @@ export const LiveWorkerProvider = () =>
             newCrons.some((cron, index) => cron !== oldCrons[index]);
           if (
             domainsChanged ||
+            routesChanged ||
             cronsChanged ||
             (yield* hasChanged(id, news, output))
           ) {
@@ -1988,6 +2224,7 @@ export const LiveWorkerProvider = () =>
             durableObjectNamespaces,
             accountId,
             domains: [],
+            routes: [],
             crons: [],
           } satisfies Worker["Attributes"];
         }),
@@ -2006,20 +2243,22 @@ export const LiveWorkerProvider = () =>
             // `WorkerNotFound` if the script doesn't exist, which the
             // surrounding `Effect.catchTag` turns into `undefined` — that's
             // all the existence check we need.
-            const [subdomain, settings, domainsList] = yield* Effect.all([
-              getScriptSubdomain({
-                accountId,
-                scriptName: workerName,
-              }),
-              getScriptSettings({
-                accountId,
-                scriptName: workerName,
-              }),
-              listDomains({
-                accountId,
-                service: workerName,
-              }).pipe(Effect.map((r) => r.result ?? [])),
-            ]);
+            const [subdomain, settings, domainsList, routesList] =
+              yield* Effect.all([
+                getScriptSubdomain({
+                  accountId,
+                  scriptName: workerName,
+                }),
+                getScriptSettings({
+                  accountId,
+                  scriptName: workerName,
+                }),
+                listDomains({
+                  accountId,
+                  service: workerName,
+                }).pipe(Effect.map((r) => r.result ?? [])),
+                readWorkerRoutes(workerName),
+              ]);
             // Preserve the order the user provided in `olds.domain`. The
             // Cloudflare API returns domains in non-deterministic order,
             // which would cause downstream `worker.domains[0]` reads to flip
@@ -2059,6 +2298,7 @@ export const LiveWorkerProvider = () =>
                 settings.bindings,
               ),
               domains,
+              routes: routesList,
               crons,
             } satisfies Worker["Attributes"];
 
@@ -2167,6 +2407,17 @@ export const LiveWorkerProvider = () =>
                       ),
                     ]
                   : [],
+              ),
+              { concurrency: "unbounded" },
+            );
+          }
+          if (output.routes?.length) {
+            yield* Effect.all(
+              output.routes.map((route) =>
+                deleteRoute({
+                  zoneId: route.zoneId,
+                  routeId: route.id,
+                }).pipe(Effect.catchTag("RouteNotFound", () => Effect.void)),
               ),
               { concurrency: "unbounded" },
             );
